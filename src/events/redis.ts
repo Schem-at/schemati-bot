@@ -197,14 +197,30 @@ async function handleChannelsCleanup(client: Client, event: ChannelsCleanupEvent
 export const CHANNEL = `${config.redis.prefix}bot:events`;
 
 export function startRedisSubscriber(client: Client): void {
-  const subscriber = new Redis(config.redis.url);
+  const subscriber = new Redis(config.redis.url, {
+    // Keep retrying forever, but make every failure visible rather than silently degrading.
+    maxRetriesPerRequest: null,
+    retryStrategy: (times) => {
+      const delay = Math.min(times * 1000, 30_000);
+      console.error(`[redis] connection failed (attempt ${times}); retrying in ${delay}ms`);
+      return delay;
+    },
+  });
+
+  // Surface every connection state change. A broken Redis used to fail silently: the bot
+  // stayed "up" but never received any events from the web app.
+  subscriber.on('error', (err) => console.error('[redis] error:', err.message));
+  subscriber.on('connect', () => console.log('[redis] connecting...'));
+  subscriber.on('ready', () => console.log('[redis] ready'));
+  subscriber.on('reconnecting', () => console.warn('[redis] reconnecting...'));
+  subscriber.on('end', () => console.error('[redis] connection closed (no more reconnects)'));
 
   subscriber.subscribe(CHANNEL, (err) => {
     if (err) {
-      console.error(`Failed to subscribe to ${CHANNEL}:`, err);
+      console.error(`[redis] failed to subscribe to ${CHANNEL}:`, err.message);
       return;
     }
-    console.log(`Subscribed to ${CHANNEL} Redis channel`);
+    console.log(`[redis] subscribed to ${CHANNEL}`);
   });
 
   subscriber.on('message', async (_channel: string, message: string) => {

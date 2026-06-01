@@ -80,15 +80,21 @@ It does not run its own database. It expects the same PostgreSQL database and Re
 | `DISCORD_CLIENT_ID` | yes | | Discord application client id |
 | `DISCORD_DEV_GUILD_ID` | no | | Guild id used when dev mode is enabled |
 | `DEV_MODE` | no | `false` | When true, the bot only responds to and deploys commands to the dev guild |
-| `DATABASE_URL` | yes | | PostgreSQL connection string for the Schemati database |
-| `API_BASE_URL` | yes | | Base URL of the Schemati API |
+| `DATABASE_URL` | yes (or `DB_*`) | | PostgreSQL connection string. Alternatively set `DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USERNAME`, `DB_PASSWORD` (and optional `DB_SSLMODE`) |
+| `API_BASE_URL` | yes (or `APP_URL`) | | Public base URL of the app. It builds clickable links in Discord, so use the public URL. Falls back to `APP_URL` |
 | `API_TOKEN` | no | | Token for authenticated API calls |
-| `STORAGE_BASE_URL` | no | `http://localhost:9000` | Object storage base URL |
-| `REDIS_URL` | no | `redis://localhost:6379` | Redis connection string |
-| `REDIS_PREFIX` | no | `schemati_database_` | Key prefix for Redis pub/sub channels |
-| `BOT_SECRET` | no | | Shared secret used to verify requests |
+| `STORAGE_BASE_URL` | no | `AWS_URL` or `http://localhost:9000` | Object storage base URL |
+| `REDIS_URL` | no (or `REDIS_*`) | `redis://localhost:6379` | Redis connection string. Alternatively set `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD` |
+| `REDIS_PREFIX` | no | `slug(APP_NAME)_database_` | Key prefix for Redis pub/sub channels. Must match the web application |
+| `BOT_SECRET` | no | | Shared secret for bot uploads. Must match the web application's `BOT_SECRET` |
 
-Configuration is read entirely from environment variables. Never commit your `.env` file.
+Configuration is read entirely from environment variables. The bot accepts either single
+connection strings (`DATABASE_URL`, `REDIS_URL`) or the discrete Laravel-style variables
+(`DB_*`, `REDIS_*`), so it can reuse the same environment as the web application. Never
+commit your `.env` file.
+
+If Postgres is unreachable at startup the bot retries, then exits so the platform restarts it.
+If Redis drops, the bot logs the failure and keeps reconnecting. Neither fails silently.
 
 ## Scripts
 
