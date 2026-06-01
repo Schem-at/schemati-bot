@@ -57,7 +57,11 @@ function redisUrl(): string {
   }
 
   const port = process.env.REDIS_PORT ?? '6379';
-  const auth = process.env.REDIS_PASSWORD ? `:${encodeURIComponent(process.env.REDIS_PASSWORD)}@` : '';
+  // Laravel passes the literal string "null" when there is no Redis password; treat that
+  // (and empty) as no auth instead of trying to authenticate with the word "null".
+  const password = process.env.REDIS_PASSWORD;
+  const hasPassword = password && password.toLowerCase() !== 'null';
+  const auth = hasPassword ? `:${encodeURIComponent(password)}@` : '';
 
   return `redis://${auth}${host}:${port}`;
 }
