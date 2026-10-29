@@ -1,6 +1,8 @@
 import Redis from 'ioredis';
 import type { Client } from 'discord.js';
 import { config } from '../config.js';
+import { deployCommands } from '../commands/deploy.js';
+import { errorMessage, record, sendHeartbeat } from '../telemetry.js';
 import { createChannels, deleteChannels, deleteCategory, postSchematicEmbed, createForumThread, postCommentToThread, populateForumChannels } from '../services/channel-sync.js';
 
 interface BotEvent {
@@ -64,6 +66,16 @@ interface CommentPostedEvent extends BotEvent {
   content: string;
 }
 
+interface AdminEvent extends BotEvent {
+  type: 'admin.ping' | 'admin.refresh' | 'admin.redeploy_commands' | 'admin.leave_guild';
+  requestId?: string;
+  guildId?: string;
+}
+
+function isAdminEvent(event: BotEvent): event is AdminEvent {
+  return typeof event.type === 'string' && event.type.startsWith('admin.');
+}
+
 function isDiscordLinkedEvent(event: BotEvent): event is DiscordLinkedEvent {
   return event.type === 'discord.linked'
     && typeof event.discordId === 'string'
@@ -104,6 +116,7 @@ async function handleDiscordLinked(client: Client, event: DiscordLinkedEvent): P
     console.log(`DM sent to ${user.tag} for account link`);
   } catch (error) {
     console.error(`Failed to DM user ${event.discordId}:`, error);
+    throw error;
   }
 }
 
@@ -112,8 +125,7 @@ async function handleChannelsSync(client: Client, event: ChannelsSyncEvent): Pro
 
   const guild = client.guilds.cache.get(event.guildId);
   if (!guild) {
-    console.error(`Guild ${event.guildId} not found in cache`);
-    return;
+    throw new Error(`Guild ${event.guildId} not found in cache (is the bot still in that server?)`);
   }
 
   // Process deletions first
@@ -149,8 +161,7 @@ async function handleSchematicPosted(client: Client, event: SchematicPostedEvent
 
   const guild = client.guilds.cache.get(event.guildId);
   if (!guild) {
-    console.error(`Guild ${event.guildId} not found in cache`);
-    return;
+    throw new Error(`Guild ${event.guildId} not found in cache (is the bot still in that server?)`);
   }
 
   if (event.channelType === 'forum') {
@@ -165,8 +176,7 @@ async function handleCommentPosted(client: Client, event: CommentPostedEvent): P
 
   const guild = client.guilds.cache.get(event.guildId);
   if (!guild) {
-    console.error(`Guild ${event.guildId} not found in cache`);
-    return;
+    throw new Error(`Guild ${event.guildId} not found in cache (is the bot still in that server?)`);
   }
 
   await postCommentToThread(guild, event.threadId, event.author, event.authorUuid, event.content);
@@ -177,8 +187,7 @@ async function handleChannelsCleanup(client: Client, event: ChannelsCleanupEvent
 
   const guild = client.guilds.cache.get(event.guildId);
   if (!guild) {
-    console.error(`Guild ${event.guildId} not found in cache`);
-    return;
+    throw new Error(`Guild ${event.guildId} not found in cache (is the bot still in that server?)`);
   }
 
   // Delete all mapped channels
@@ -194,7 +203,45 @@ async function handleChannelsCleanup(client: Client, event: ChannelsCleanupEvent
   console.log(`Finished channels.cleanup for guild ${event.guildId}`);
 }
 
+/**
+ * Commands from the website's admin monitor. The outcome is recorded like any other event;
+ * ping and refresh answer straight away so the admin page updates promptly.
+ */
+async function handleAdmin(client: Client, event: AdminEvent): Promise<void> {
+  switch (event.type) {
+    case 'admin.ping':
+      record({ kind: 'admin', name: 'admin.ping', status: 'ok', correlation_id: event.requestId ?? null });
+      await sendHeartbeat();
+      return;
+    case 'admin.refresh':
+      await sendHeartbeat();
+      return;
+    case 'admin.redeploy_commands':
+      await deployCommands();
+      return;
+    case 'admin.leave_guild': {
+      const guild = event.guildId ? client.guilds.cache.get(event.guildId) : undefined;
+      if (!guild) {
+        throw new Error(`Guild ${event.guildId} not found in cache`);
+      }
+      console.log(`[admin] leaving guild ${guild.name} (${guild.id})`);
+      await guild.leave();
+      return;
+    }
+    default:
+      throw new Error(`Unknown admin command ${event.type}`);
+  }
+}
+
 export const CHANNEL = `${config.redis.prefix}bot:events`;
+
+let activeSubscriber: Redis | null = null;
+let subscribed = false;
+
+/** True while the subscriber is connected and listening (ioredis resubscribes on reconnect). */
+export function isRedisReady(): boolean {
+  return subscribed && activeSubscriber?.status === 'ready';
+}
 
 export function startRedisSubscriber(client: Client): void {
   const subscriber = new Redis(config.redis.url, {
@@ -206,6 +253,8 @@ export function startRedisSubscriber(client: Client): void {
       return delay;
     },
   });
+
+  activeSubscriber = subscriber;
 
   // Surface every connection state change. A broken Redis used to fail silently: the bot
   // stayed "up" but never received any events from the web app.
@@ -220,14 +269,36 @@ export function startRedisSubscriber(client: Client): void {
       console.error(`[redis] failed to subscribe to ${CHANNEL}:`, err.message);
       return;
     }
+    subscribed = true;
     console.log(`[redis] subscribed to ${CHANNEL}`);
   });
 
   subscriber.on('message', async (_channel: string, message: string) => {
+    let parsed: BotEvent;
     try {
-      const event = JSON.parse(message) as BotEvent;
+      parsed = JSON.parse(message) as BotEvent;
+    } catch (error) {
+      console.error('Error parsing Redis event:', error);
+      record({ kind: 'event', name: 'invalid', status: 'error', message: `Unparseable event: ${errorMessage(error)}` });
+      return;
+    }
 
-      if (isDiscordLinkedEvent(event)) {
+    const event = parsed;
+    const startedAt = Date.now();
+    const isAdmin = isAdminEvent(event);
+    const base = {
+      kind: isAdmin ? ('admin' as const) : ('event' as const),
+      name: String(event.type ?? 'unknown').slice(0, 100),
+      guild_id: typeof event.guildId === 'string' ? event.guildId : null,
+      channel_id: typeof event.channelId === 'string' ? event.channelId : typeof event.threadId === 'string' ? event.threadId : null,
+      actor_id: typeof event.discordId === 'string' ? event.discordId : null,
+    };
+
+    try {
+      let handled = true;
+      if (isAdmin) {
+        await handleAdmin(client, event);
+      } else if (isDiscordLinkedEvent(event)) {
         await handleDiscordLinked(client, event);
       } else if (isChannelsSyncEvent(event)) {
         await handleChannelsSync(client, event);
@@ -237,9 +308,22 @@ export function startRedisSubscriber(client: Client): void {
         await handleSchematicPosted(client, event);
       } else if (isCommentPostedEvent(event)) {
         await handleCommentPosted(client, event);
+      } else {
+        handled = false;
+      }
+
+      // admin.ping records its own answer (with the correlation id) before flushing.
+      if (event.type !== 'admin.ping') {
+        record({
+          ...base,
+          status: handled ? 'ok' : 'error',
+          duration_ms: Date.now() - startedAt,
+          message: handled ? null : 'Unrecognised or malformed event',
+        });
       }
     } catch (error) {
       console.error('Error handling Redis event:', error);
+      record({ ...base, status: 'error', duration_ms: Date.now() - startedAt, message: errorMessage(error) });
     }
   });
 }

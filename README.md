@@ -86,7 +86,8 @@ It does not run its own database. It expects the same PostgreSQL database and Re
 | `STORAGE_BASE_URL` | no | `AWS_URL` or `http://localhost:9000` | Object storage base URL |
 | `REDIS_URL` | no (or `REDIS_*`) | `redis://localhost:6379` | Redis connection string. Alternatively set `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD` |
 | `REDIS_PREFIX` | no | `slug(APP_NAME)_database_` | Key prefix for Redis pub/sub channels. Must match the web application |
-| `BOT_SECRET` | no | | Shared secret for bot uploads. Must match the web application's `BOT_SECRET` |
+| `BOT_SECRET` | no | | Shared secret for bot uploads and admin telemetry. Must match the web application's `BOT_SECRET`. Without it, uploads and the admin monitor are disabled |
+| `BOT_BUILD_SHA` | no | | Optional git sha appended to the version shown in the admin monitor |
 
 Configuration is read entirely from environment variables. The bot accepts either single
 connection strings (`DATABASE_URL`, `REDIS_URL`) or the discrete Laravel-style variables
@@ -106,3 +107,13 @@ If Redis drops, the bot logs the failure and keeps reconnecting. Neither fails s
 | `npm run deploy-commands` | Register slash commands with Discord |
 | `npm run db:pull` | Introspect the database schema with drizzle-kit |
 | `npm run db:studio` | Open Drizzle Studio |
+
+## Admin monitoring
+
+Every 30 seconds the bot sends a heartbeat to the web app (`POST /api/v1/bot/telemetry/heartbeat`,
+authenticated with `BOT_SECRET`). It carries the bot's health, the Discord servers it is in (with any
+missing permissions), and a batch of recent activity: slash commands, processed events, and server
+joins and leaves. Admins see it at `/admin/discord-bot`. From there they can ping the bot, ask for a
+fresh heartbeat, re-register slash commands, or make it leave a server. Those requests arrive as
+`admin.*` events on the usual Redis channel. Telemetry is best effort: if the web app is unreachable,
+the bot keeps working and retries quietly.
