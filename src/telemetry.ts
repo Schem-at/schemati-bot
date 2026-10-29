@@ -35,6 +35,7 @@ const REQUIRED_PERMISSIONS: Record<string, bigint> = {
   ManageChannels: PermissionFlagsBits.ManageChannels,
   CreatePublicThreads: PermissionFlagsBits.CreatePublicThreads,
   SendMessagesInThreads: PermissionFlagsBits.SendMessagesInThreads,
+  AddReactions: PermissionFlagsBits.AddReactions,
 };
 
 const MAX_BUFFER = 500;

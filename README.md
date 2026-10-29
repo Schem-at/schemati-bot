@@ -123,8 +123,11 @@ the bot keeps working and retries quietly.
 When someone drops a `.schem`, `.schematic` or `.litematic` file (up to 10 MB) in a server, the bot asks
 the website for a render (`POST /api/v1/bot/renders`), shows "typing" while a render node works on it,
 and replies with the picture. Renders are done by render nodes (see `render-node/` in the main repo).
-If no node is online, auto-render is turned off for the server (admin page, Servers tab), the file is too
-big, or anything fails, the bot stays silent; the outcome shows up as `render` activity in the admin monitor.
+
+Progress shows as one status reaction on the dropped file: 👀 seen, ⏳ queued, 🎨 rendering, ✅ done,
+💤 no render node available, ⚠️ couldn't render it (too big, unreadable, error). Nothing else is posted
+on failure, and servers with auto-render turned off (admin page, Servers tab) get nothing at all. Every
+outcome also shows up as `render` activity in the admin monitor.
 
 This needs the privileged **Message Content** intent, enabled under Bot → Privileged Gateway Intents in
 the Discord developer portal. Without it the bot logs in without the intent, auto-render stays off, and a
