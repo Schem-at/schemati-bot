@@ -1,11 +1,12 @@
-import { type Message, PermissionFlagsBits } from 'discord.js';
+import { type Message, PermissionFlagsBits, Routes } from 'discord.js';
 import { config } from '../config.js';
 import { errorMessage, guildSetting, record } from '../telemetry.js';
 
 /**
  * Auto-render: when someone drops a schematic file in a server, ask the website for a render
- * (done by a render node), wait for it, and reply with the picture. Every way this can fail is
- * silent in Discord; outcomes are reported to the admin monitor as `render` activity.
+ * (done by a render node), wait for it, and reply with the picture. Progress shows as a single
+ * status reaction on the dropped file; nothing else is ever posted on failure. Outcomes are also
+ * reported to the admin monitor as `render` activity.
  */
 
 const SCHEMATIC_FILE = /\.(schem|schematic|litematic)$/i;
@@ -14,6 +15,41 @@ const MAX_IN_FLIGHT = 4;
 const POLL_INTERVAL_MS = 1_000;
 const TYPING_INTERVAL_MS = 8_000;
 const GIVE_UP_AFTER_MS = 200_000;
+
+/** One status reaction at a time on the dropped file; each new one replaces the last. */
+const STATUS = {
+  seen: '👀',
+  queued: '⏳',
+  rendering: '🎨',
+  done: '✅',
+  noNodes: '💤',
+  failed: '⚠️',
+} as const;
+type Status = keyof typeof STATUS;
+
+/** Best effort: missing Add Reactions or a deleted message must never break the render. */
+class StatusReaction {
+  private current: string | null = null;
+  /** Changes apply strictly in order, so a removal can never overtake the add it undoes. */
+  private chain: Promise<void> = Promise.resolve();
+
+  constructor(private readonly message: Message<true>) {}
+
+  set(status: Status | null): Promise<void> {
+    const next = status ? STATUS[status] : null;
+    if (next === this.current) return this.chain;
+    const previous = this.current;
+    this.current = next;
+    this.chain = this.chain.then(async () => {
+      if (next) await this.message.react(next).catch(() => {});
+      if (previous) {
+        const route = Routes.channelMessageOwnReaction(this.message.channelId, this.message.id, encodeURIComponent(previous));
+        await this.message.client.rest.delete(route).catch(() => {});
+      }
+    });
+    return this.chain;
+  }
+}
 
 interface RenderJob {
   id: string;
@@ -55,6 +91,8 @@ export async function onMessageCreate(message: Message): Promise<void> {
 
   inFlight += 1;
   const startedAt = Date.now();
+  const status = new StatusReaction(message);
+  void status.set('seen');
   const base = { kind: 'render' as const, name: 'auto_render', guild_id: message.guildId, channel_id: message.channelId, actor_id: message.author.id, actor_tag: message.author.tag };
 
   try {
@@ -73,7 +111,10 @@ export async function onMessageCreate(message: Message): Promise<void> {
     });
     if (created.status === 409) {
       const body = (await created.json().catch(() => ({}))) as { reason?: string };
-      if (body.reason !== 'disabled') {
+      if (body.reason === 'disabled') {
+        await status.set(null);
+      } else {
+        await status.set('noNodes');
         record({ ...base, status: 'skipped', message: `${attachment.name}: ${body.reason ?? 'unavailable'}` });
       }
       return;
@@ -83,6 +124,7 @@ export async function onMessageCreate(message: Message): Promise<void> {
     let job = ((await created.json()) as { data: RenderJob }).data;
     let lastTyping = 0;
     while (job.status === 'queued' || job.status === 'claimed') {
+      void status.set(job.status === 'claimed' ? 'rendering' : 'queued');
       if (Date.now() - startedAt > GIVE_UP_AFTER_MS) throw new Error('gave up waiting for the render');
       if (Date.now() - lastTyping > TYPING_INTERVAL_MS && job.status === 'claimed') {
         lastTyping = Date.now();
@@ -96,6 +138,7 @@ export async function onMessageCreate(message: Message): Promise<void> {
 
     if (job.status !== 'done') {
       // Too large, unparsable, timed out: nothing worth telling the channel about.
+      await status.set(job.error_code === 'no_node' ? 'noNodes' : 'failed');
       const skippedCodes = ['too_large', 'no_node'];
       record({
         ...base,
@@ -117,6 +160,7 @@ export async function onMessageCreate(message: Message): Promise<void> {
       files: [{ attachment: png, name: `${attachment.name.replace(SCHEMATIC_FILE, '')}.png` }],
       allowedMentions: { parse: [], repliedUser: false },
     });
+    await status.set('done');
 
     record({
       ...base,
@@ -126,6 +170,7 @@ export async function onMessageCreate(message: Message): Promise<void> {
       meta: { job_id: job.id, node: job.node, block_count: job.block_count, render_ms: job.render_ms },
     });
   } catch (error) {
+    await status.set('failed');
     console.warn(`[render] ${attachment.name} in ${message.guildId}: ${errorMessage(error)}`);
     record({ ...base, status: 'error', duration_ms: Date.now() - startedAt, message: `${attachment.name}: ${errorMessage(error)}` });
   } finally {
