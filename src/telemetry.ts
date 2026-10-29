@@ -13,7 +13,7 @@ export type ActivityKind = 'command' | 'event' | 'guild' | 'lifecycle' | 'admin'
 export interface Activity {
   kind: ActivityKind;
   name: string;
-  status: 'ok' | 'error';
+  status: 'ok' | 'error' | 'skipped';
   guild_id?: string | null;
   channel_id?: string | null;
   actor_id?: string | null;
@@ -54,6 +54,8 @@ let inFlight = false;
 let sendAgain = false;
 let lastFailureLoggedAt = 0;
 let redisReady: () => boolean = () => false;
+let capabilities: string[] = [];
+let guildSettings: Record<string, Record<string, unknown>> = {};
 
 function readVersion(): string {
   let pkgVersion = 'unknown';
@@ -97,7 +99,12 @@ export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-export function startTelemetry(readyClient: Client<true>, isRedisReady: () => boolean): void {
+/** Per-server switch from the admin page, as of the last heartbeat; undefined until the first one. */
+export function guildSetting(guildId: string, key: string): unknown {
+  return guildSettings[guildId]?.[key];
+}
+
+export function startTelemetry(readyClient: Client<true>, isRedisReady: () => boolean, botCapabilities: string[] = []): void {
   if (!enabled()) {
     console.warn('[telemetry] BOT_SECRET is not set; admin monitoring is disabled');
     return;
@@ -105,6 +112,7 @@ export function startTelemetry(readyClient: Client<true>, isRedisReady: () => bo
 
   client = readyClient;
   redisReady = isRedisReady;
+  capabilities = botCapabilities;
   record({ kind: 'lifecycle', name: 'started', status: 'ok', message: `v${version}, ${readyClient.guilds.cache.size} servers` });
   void sendHeartbeat();
   schedule();
@@ -169,7 +177,7 @@ export async function sendHeartbeat(): Promise<void> {
         gateway_ping_ms: Number.isFinite(ping) && ping >= 0 ? Math.round(ping) : null,
         memory_rss_mb: Math.round((process.memoryUsage().rss / 1024 / 1024) * 10) / 10,
         redis_ready: redisReady(),
-        capabilities: [],
+        capabilities,
         guilds_complete: true,
         guilds: guildSnapshot(client),
         activities: batch,
@@ -183,7 +191,10 @@ export async function sendHeartbeat(): Promise<void> {
       throw new Error(`HTTP ${response.status}`);
     }
 
-    const body = (await response.json()) as { data?: { heartbeat_interval?: number } };
+    const body = (await response.json()) as {
+      data?: { heartbeat_interval?: number; guild_settings?: Record<string, Record<string, unknown>> };
+    };
+    if (body.data?.guild_settings) guildSettings = body.data.guild_settings;
     const next = (body.data?.heartbeat_interval ?? 30) * 1000;
     if (next >= 5_000 && next !== intervalMs) {
       intervalMs = next;
